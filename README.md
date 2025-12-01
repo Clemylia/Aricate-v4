@@ -1675,3 +1675,13 @@ if __name__ == '__main__':
         except (EOFError, ValueError) as e:
             print(f"\nERREUR FATALE LORS DE LA LECTURE DU FICHIER ARICA : {e}")
 ```
+
+# 📚 Futur de Aricate v4 (Aricate v5) :
+
+Nous avons observé que la sémantique des SLM et LLM crée avec Aricate v4,avait tendance a vriller, a dire des phrases illogiques et a mélanger les faits quand il y avait beaucoup de données, et a l'inverse, a tendance a répéter mot pour mot les données d'entraînement quand elles sont trop peu nombreuses.
+
+c'est pour celà que vous prévoyons déjà l'innovation **Aricate v5** pour l'avenir !
+
+ Aricate v5, sera une nouvelle version de l'architecture Aricate v4, visant a modifier la sémantique générale de l'architecture et a faire évoluer vos modèles de languages vers plus de cohérence !
+
+restez a l'affût !
