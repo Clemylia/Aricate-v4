@@ -1676,6 +1676,459 @@ if __name__ == '__main__':
             print(f"\nERREUR FATALE LORS DE LA LECTURE DU FICHIER ARICA : {e}")
 ```
 
+🩷 Affinage (fine-tuning), d'un SLM ARICATE pour ajouter votre cas d'utilisation et vos mots dans son vocabulaire :
+
+```
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import collections
+from datasets import load_dataset
+from huggingface_hub import PyTorchModelHubMixin, HfApi, notebook_login, hf_hub_download
+import os
+import time
+import json
+import heapq
+from safetensors.torch import save_file as save_safetensors_file
+from safetensors.torch import load_file as load_safetensors_file # Added import for load_safetensors_file
+from typing import Dict, List
+
+# --- A. WordTokenizer (MODIFIÉ pour le Fine-Tuning) ---
+class WordTokenizer:
+    """Tokenizer simple pour l'architecture Aricate, avec support pour l'extension de vocabulaire."""
+    def __init__(self, texts: List[str] = None, existing_vocab: Dict[str, int] = None):
+
+        self.special_tokens = {
+            '<pad>': 0,
+            '<unk>': 1,
+            '<eos>': 2,
+            '<sep>': 3,
+        }
+
+        # 1. Initialiser avec les tokens spéciaux
+        self.word_to_id = self.special_tokens.copy()
+        next_id = len(self.special_tokens)
+
+        # 2. Charger le vocabulaire existant (si fine-tuning)
+        if existing_vocab:
+            print("Chargement du vocabulaire pré-existant...")
+            for word, id in existing_vocab.items():
+                # On s'assure de ne pas écraser les tokens spéciaux
+                if word not in self.word_to_id and id >= next_id:
+                    self.word_to_id[word] = id
+                    next_id = max(next_id, id + 1)
+
+        # 3. Ajouter les nouveaux mots (si des textes sont fournis)
+        if texts:
+            print("Analyse des nouveaux textes et extension du vocabulaire...")
+            all_words = []
+            for text in texts:
+                words = text.lower().split()
+                all_words.extend(words)
+
+            word_counts = collections.Counter(all_words)
+
+            # Ajouter les mots qui ne sont pas déjà dans le vocabulaire
+            for word, count in word_counts.most_common():
+                if word not in self.word_to_id:
+                    self.word_to_id[word] = next_id
+                    next_id += 1
+
+        self.id_to_word = {id: word for word, id in self.word_to_id.items()}
+        self.vocab_size = len(self.word_to_id)
+        print(f"Tokenisation effectuée. Taille du vocabulaire finale : {self.vocab_size}")
+
+    def encode(self, text, add_eos=False):
+        words = text.lower().split()
+        if add_eos:
+            words.append('<eos>')
+
+        ids = [self.word_to_id.get(word, self.word_to_id['<unk>']) for word in words]
+        return ids
+
+    def decode(self, ids):
+        words = [self.id_to_word.get(id, '<unk>') for id in ids]
+        return " ".join(word for word in words if word not in ['<pad>', '<unk>', '<eos>', '<sep>'])
+
+# --- B. AricateAttentionLayer (Inchangé) ---
+class AricateAttentionLayer(nn.Module):
+    """Couche d'Attention Additive (Bahdanau)."""
+    def __init__(self, hidden_dim):
+        super(AricateAttentionLayer, self).__init__()
+        self.W = nn.Linear(hidden_dim, hidden_dim)
+        self.U = nn.Linear(hidden_dim, hidden_dim)
+        self.V = nn.Linear(hidden_dim, 1, bias=False)
+    def forward(self, rnn_outputs, last_hidden):
+        last_hidden_expanded = last_hidden.unsqueeze(1)
+        energy = torch.tanh(self.W(rnn_outputs) + self.U(last_hidden_expanded))
+        attention_weights_raw = self.V(energy).squeeze(2)
+        attention_weights = F.softmax(attention_weights_raw, dim=1)
+        context_vector = torch.sum(rnn_outputs * attention_weights.unsqueeze(2), dim=1)
+        return context_vector
+
+# --- C. AricateModel V4 (Inchangé) ---
+class AricateModel(nn.Module, PyTorchModelHubMixin):
+    """Architecture Aricate V4. Hérite de PyTorchModelHubMixin pour la sauvegarde et la publication."""
+    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int = 1, config: dict = None):
+        super(AricateModel, self).__init__()
+
+        if config is not None:
+             vocab_size = config.get("vocab_size", vocab_size)
+             embedding_dim = config.get("embedding_dim", embedding_dim)
+             hidden_dim = config.get("hidden_dim", hidden_dim)
+             num_layers = config.get("num_layers", num_layers)
+
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        self.word_embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim, padding_idx=0)
+        self.rnn = nn.GRU(input_size=embedding_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True)
+        self.attention = AricateAttentionLayer(hidden_dim)
+        self.hidden_to_vocab = nn.Linear(hidden_dim * 2, vocab_size)
+
+    def forward(self, input_words):
+        embeds = self.word_embeddings(input_words)
+        rnn_out, hn = self.rnn(embeds)
+        last_hidden = hn[-1]
+        context_vector = self.attention(rnn_out, last_hidden)
+        combined_features = torch.cat((context_vector, last_hidden), dim=1)
+        logits = self.hidden_to_vocab(combined_features)
+        return logits
+
+# --- D. Fonctions de Préparation et de Génération (Inchangé) ---
+def generate_sequence_beam(model, tokenizer, question, max_length, max_len_input, beam_size=3):
+    """Génère la réponse en utilisant la Beam Search."""
+    model.eval()
+
+    sep_id = tokenizer.special_tokens['<sep>']
+    eos_id = tokenizer.special_tokens['<eos>']
+
+    question_ids = tokenizer.encode(question)
+    initial_sequence = question_ids + [sep_id]
+
+    beam = [(-0.0, initial_sequence)]
+    finished_sequences = []
+
+    print(f"\n--- Q/A Génération (Beam Search, K={beam_size}) ---")
+    print(f"Question: '{question}'")
+
+    with torch.no_grad():
+        for _ in range(max_length):
+            candidates = []
+            for neg_log_prob_prev, sequence in beam:
+                input_ids_to_pad = sequence[-max_len_input:] if len(sequence) > max_len_input else sequence
+                padding_needed = max_len_input - len(input_ids_to_pad)
+                input_ids_padded = [tokenizer.special_tokens['<pad>']] * padding_needed + input_ids_to_pad
+                input_tensor = torch.tensor(input_ids_padded).unsqueeze(0)
+
+                device = next(model.parameters()).device
+                input_tensor = input_tensor.to(device)
+
+                logits = model(input_tensor)
+                log_probabilities = F.log_softmax(logits, dim=-1).squeeze(0)
+
+                top_log_probs, top_indices = torch.topk(log_probabilities, beam_size)
+
+                for log_prob_next, predicted_id in zip(top_log_probs.tolist(), top_indices.tolist()):
+                    new_score = neg_log_prob_prev + (-log_prob_next)
+                    new_sequence = sequence + [predicted_id]
+                    candidates.append((new_score, new_sequence))
+
+            candidates.sort(key=lambda x: x[0])
+            beam = candidates[:beam_size]
+
+            new_beam = []
+            for score, sequence in beam:
+                last_word_id = sequence[-1]
+                if last_word_id == eos_id:
+                    finished_sequences.append((score, sequence))
+                else:
+                    new_beam.append((score, sequence))
+
+            beam = new_beam
+            if not beam and finished_sequences:
+                break
+            if not beam and not finished_sequences:
+                break
+
+    if finished_sequences:
+        finished_sequences.sort(key=lambda x: x[0])
+        best_sequence = finished_sequences[0]
+    elif beam:
+        beam.sort(key=lambda x: x[0])
+        best_sequence = beam[0]
+    else:
+        print("Génération terminée : aucune séquence valide trouvée.")
+        return "Je n'ai pas pu générer une réponse cohérente."
+
+    final_ids = best_sequence[1]
+    try:
+        sep_index = final_ids.index(sep_id)
+        response_ids = [id for id in final_ids[sep_index+1:] if id != eos_id]
+    except ValueError:
+        response_ids = final_ids
+
+    final_response = tokenizer.decode(response_ids)
+
+    print(f"Meilleur score (-logP): {best_sequence[0]:.4f}")
+    print(f"Réponse générée: '{final_response}'")
+    print("-" * 40)
+
+    return final_response
+
+
+# --- Nouvelle Classe PyTorch Dataset (Inchangé) ---
+class AricateDataset(Dataset):
+    """Dataset personnalisé pour PyTorch."""
+    def __init__(self, X_data, Y_data):
+        self.X = X_data
+        self.Y = Y_data
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+# --- E. Fonction Principale (MODIFIÉE pour le Fine-Tuning) ---
+def fine_tune_melta27_and_publish():
+    # --- Configuration ---
+
+    # ℹ️ NOUVEAU: ID du modèle à charger pour le Fine-Tuning
+    PRETRAINED_MODEL_ID = "Clemylia/Melta27"
+
+    # ℹ️ NOUVEAU: Ta dataset
+    NEW_DATASET_NAME = "Eleonord/Animaux"
+
+    # ℹ️ NOUVEAU: Ton futur dépôt sur Hugging Face
+    # Assure-toi que tu as créé ce dépôt sur ton compte HF
+    REPO_ID = "Eleonord/Melta27-Animaux"
+    MODEL_NAME = "melta_animaux"
+
+    # ↑️ PARAMÈTRES D'ENTRAÂNEMENT AJUSTÉS ↑️
+    # Ces valeurs seront lues depuis la configuration du modèle chargé
+    # EMBEDDING_DIM = 64
+    # HIDDEN_DIM = 128
+    # NUM_LAYERS = 2
+    NUM_EPOCHS = 10
+    BATCH_SIZE = 128
+
+    LEARNING_RATE = 0.005
+    MAX_GENERATION_LENGTH = 30
+    BEAM_SIZE = 3
+
+    # --- Configuration de l'appareil (GPU/CPU) ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Appareil d'entraînement sélectionné: {device}")
+
+
+    # --- Connexion Hugging Face ---
+    print("\n" + "="*50)
+    print(">>> CONNEXION HUGGING FACE REQUISE POUR LA PUBLICATION <<<")
+    notebook_login(new_session=False)
+    print("Connexion établie (Vérifiez si le token a la permission 'Write').")
+    print("="*50)
+
+    print(f"--- Lancement du Fine-Tuning du SLM {MODEL_NAME} (Aricate) ---")
+
+    # 1. Chargement de la Configuration et du Tokenizer de Melta27
+    print(f"\n1. Chargement de la configuration et du vocabulaire de '{PRETRAINED_MODEL_ID}'...")
+
+    # On télécharge la config pour connaître les hyperparamètres (dim, layers...)
+    config_path = hf_hub_download(repo_id=PRETRAINED_MODEL_ID, filename="config.json", repo_type="model")
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+
+    # On télécharge le vocabulaire existant
+    tokenizer_path = hf_hub_download(repo_id=PRETRAINED_MODEL_ID, filename="aricate_tokenizer.txt", repo_type="model")
+    with open(tokenizer_path, 'r', encoding='utf-8') as f:
+        existing_word_to_id = json.load(f)
+
+    # 2. Préparation des données et EXTENSION du Vocabulaire
+    DATASET_SPLIT = 'train'
+    print(f"Chargement de TA dataset '{NEW_DATASET_NAME}' (split '{DATASET_SPLIT}')...")
+    new_dataset = load_dataset(NEW_DATASET_NAME, split=DATASET_SPLIT)
+
+    # Créer un corpus brut de TA dataset pour trouver les NOUVEAUX mots
+    corpus_raw = [f"{ex['question']} <sep> {ex['reponse']}" for ex in new_dataset]
+
+    # ℹ️ CRÉATION DU TOKENIZER ÉTENDU ℹ️
+    # On passe le corpus (pour les nouveaux mots) ET le vocabulaire existant
+    tokenizer = WordTokenizer(texts=corpus_raw, existing_vocab=existing_word_to_id)
+
+    # Mise à jour de la taille du vocabulaire dans la configuration
+    NEW_VOCAB_SIZE = tokenizer.vocab_size
+    OLD_VOCAB_SIZE = model_config["vocab_size"]
+
+    print(f"Taille du vocabulaire: Originale={OLD_VOCAB_SIZE}, Nouvelle={NEW_VOCAB_SIZE}")
+    model_config["vocab_size"] = NEW_VOCAB_SIZE
+
+    # 3. Préparation des Tenseurs d'Entraînement (avec le tokenizer étendu)
+    train_data_X = []
+    train_data_Y = []
+    for item in new_dataset:
+        q = item['question']
+        r = item['reponse']
+        full_seq_ids = tokenizer.encode(f"{q} <sep> {r}", add_eos=True)
+        # Création des paires d'entrée/cible
+        for i in range(1, len(full_seq_ids)):
+            X = full_seq_ids[:i]
+            Y = full_seq_ids[i]
+            train_data_X.append(X)
+            train_data_Y.append(Y)
+
+    # Padding des séquences
+    max_len = max(len(x) for x in train_data_X)
+    padded_X = []
+    for x in train_data_X:
+        padding_needed = max_len - len(x)
+        padded_X.append([tokenizer.special_tokens['<pad>']] * padding_needed + x)
+
+    X_train_tensor = torch.tensor(padded_X)
+    Y_train_tensor = torch.tensor(train_data_Y)
+
+    print(f"Nombre de paires d'entraînement: {len(Y_train_tensor)}")
+    print(f"Longueur maximale d'entrée (max_len): {max_len}")
+
+    aricate_dataset = AricateDataset(X_train_tensor, Y_train_tensor)
+    train_loader = DataLoader(
+        dataset=aricate_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2
+    )
+    print(f"Nombre de batches par époque : {len(train_loader)}")
+
+    # 4. Initialisation du Modèle et Chargement des Poids pour le Fine-Tuning
+    print("\n4. Création du nouveau modèle et chargement des poids de Melta27...")
+
+    # 4a. On crée une NOUVELLE instance du modèle avec la NOUVELLE taille de vocabulaire
+    new_model = AricateModel(**model_config)
+
+    # 4b. On charge les poids PRÉ-ENTRAÂNÉS (le .safetensors)
+    weights_path = hf_hub_download(repo_id=PRETRAINED_MODEL_ID, filename="model.safetensors", repo_type="model")
+    pretrained_state_dict = load_safetensors_file(weights_path) # Changed from torch.load to load_safetensors_file
+
+    new_model_state_dict = new_model.state_dict()
+
+    # 4c. Copie sélective des poids
+    for name, param in pretrained_state_dict.items():
+        if name in new_model_state_dict:
+            # ℹ️ CAS SPÉCIAUX: Couches dépendantes du vocabulaire
+            if name == 'word_embeddings.weight':
+                # On copie les poids des anciens mots. Les nouveaux mots gardent les poids aléatoires.
+                min_vocab = min(param.size(0), new_model_state_dict[name].size(0))
+                new_model_state_dict[name][:min_vocab].copy_(param[:min_vocab])
+                print(f"Copie des embeddings ({min_vocab}/{new_model_state_dict[name].size(0)}) mots")
+            elif name == 'hidden_to_vocab.weight' or name == 'hidden_to_vocab.bias':
+                 # La couche de sortie doit correspondre à la nouvelle taille (NEW_VOCAB_SIZE)
+                 # On ne copie que les poids des anciens mots, les nouveaux poids sont initialisés aléatoirement
+                 min_size = min(param.size(0), new_model_state_dict[name].size(0))
+                 if name == 'hidden_to_vocab.weight':
+                    new_model_state_dict[name][:min_size, :].copy_(param[:min_size, :])
+                 else: # bias
+                    new_model_state_dict[name][:min_size].copy_(param[:min_size])
+            else:
+                # ℹ️ CAS GÉNÉRAL: On copie tous les poids des couches RNN et Attention (taille inchangée)
+                new_model_state_dict[name].copy_(param)
+
+    new_model.load_state_dict(new_model_state_dict)
+
+    model = new_model.to(device) # ENVOI DU MODÈLE SUR L'APPAREIL
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # 5. Entraînement avec Batching (Fine-Tuning)
+    print(f"\n5. Début du Fine-Tuning pour {NUM_EPOCHS} époques avec un BATCH_SIZE de {BATCH_SIZE}...")
+    start_time = time.time()
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        total_loss = 0.0
+
+        for batch_X, batch_Y in train_loader:
+            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+
+            optimizer.zero_grad()
+            logits = model(batch_X)
+            loss = loss_function(logits, batch_Y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * batch_X.size(0)
+
+        avg_loss = total_loss / len(aricate_dataset)
+
+        if (epoch + 1) % 5 == 0 or epoch == NUM_EPOCHS - 1:
+            print(f'Epoch [{epoch+1}/{NUM_EPOCHS}], Loss Moyenne: {avg_loss:.4f}')
+
+    end_time = time.time()
+    print(f"\n✅ Fine-Tuning terminé ! Durée: {(end_time - start_time):.2f}s 🎉")
+
+    # 6. Phase de Test (Génération)
+    print("\n" + "="*50)
+    print(">>> 6. TEST FINAL DE MELTA27-ANIMAUX <<<")
+    print("="*50)
+    model.to(device)
+
+    # On teste avec des exemples de TA dataset
+    dataset_test = load_dataset(NEW_DATASET_NAME, split='train[:3]')
+
+    for i, item in enumerate(dataset_test):
+        if i >= 3: break
+        question = item['question']
+        generate_sequence_beam(model, tokenizer, question, MAX_GENERATION_LENGTH, max_len, BEAM_SIZE)
+
+
+    # 7. Sauvegarde et Publication sur Hugging Face
+    model.to("cpu")
+    print("\n" + "="*50)
+    print(">>> 7. SAUVEGARDE ET PUBLICATION SUR HUGGING FACE <<<")
+    print("="*50)
+
+    save_directory = f"./{MODEL_NAME}_local_save"
+    os.makedirs(save_directory, exist_ok=True)
+
+    # Sauvegarde du modèle (poids et config)
+    model.save_pretrained(save_directory)
+    print(f"Modèle sauvegardé localement dans: {save_directory}")
+
+    # Sauvegarde du NOUVEAU tokenizer (avec ton vocabulaire étendu)
+    tokenizer_path = os.path.join(save_directory, "aricate_tokenizer.txt")
+    with open(tokenizer_path, 'w', encoding='utf-8') as f:
+        json.dump(tokenizer.word_to_id, f, ensure_ascii=False)
+    print(f"Tokenizer (vocabulaire) sauvegardé dans: {tokenizer_path}")
+
+    # Publication
+    try:
+        model.push_to_hub(
+            repo_id=REPO_ID,
+            commit_message=f"Fine-Tuning sur Eleonord/Animaux. Vocabulaire étendu.",
+            config=model_config
+        )
+        HfApi().upload_file(
+            path_or_fileobj=tokenizer_path,
+            path_in_repo="aricate_tokenizer.txt",
+            repo_id=REPO_ID,
+            repo_type="model",
+            commit_message="Update Aricate custom tokenizer vocabulary (extended)."
+        )
+
+        print(f"\n✅ Publication réussie ! Ton modèle Melta27-Animaux est disponible sur : https://huggingface.co/{REPO_ID}")
+
+    except Exception as e:
+        print(f"\n❌ ERREUR DE PUBLICATION. Le modèle est sauvegardé localement mais l'envoi a échoué.")
+        print(f"Détail de l'erreur: {e}")
+
+
+# Lancement de la fonction principale
+if __name__ == '__main__':
+    fine_tune_melta27_and_publish()
+```
+
 # 📚 Futur de Aricate v4 (Aricate v5) :
 
 Nous avons observé que la sémantique des SLM et LLM crée avec Aricate v4,avait tendance a vriller, a dire des phrases illogiques et a mélanger les faits quand il y avait beaucoup de données, et a l'inverse, a tendance a répéter mot pour mot les données d'entraînement quand elles sont trop peu nombreuses.
